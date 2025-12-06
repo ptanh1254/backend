@@ -702,12 +702,15 @@ const getClientIp = (req) => {
 };
 
 const isIpAllowed = (ip) => {
+  // THÊM DÒNG NÀY: Nếu danh sách có chứa dấu * thì luôn cho phép (trả về true)
+  if (ALLOWED_IPS.includes('*')) return true; 
+
+  // Giữ nguyên logic cũ cho các trường hợp khác
   return ALLOWED_IPS.some(allowed => {
     if (allowed === 'localhost') return ip === '::1' || ip === '127.0.0.1';
     return ip.includes(allowed.trim());
   });
 };
-
 app.post('/api/attendance/checkin', async (req, res) => {
   try {
     const { staffId } = req.body;
