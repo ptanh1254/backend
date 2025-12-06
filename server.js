@@ -83,28 +83,7 @@ app.use(cors({
 
 app.use(express.json({ limit: '10kb' }));
 
-// Custom sanitization middleware
-app.use((req, res, next) => {
-  // Sanitize request body
-  if (req.body) {
-    Object.keys(req.body).forEach(key => {
-      if (typeof req.body[key] === 'string') {
-        // Remove potentially dangerous characters
-        req.body[key] = req.body[key].replace(/[$<>]/g, '');
-      }
-    });
-  }
-  
-  // Sanitize query parameters
-  if (req.query) {
-    Object.keys(req.query).forEach(key => {
-      if (typeof req.query[key] === 'string') {
-        req.query[key] = req.query[key].replace(/[$<>]/g, '');
-      }
-    });
-  }
-  next();
-});
+// Sanitization được xử lý bởi Express.json + MongoDB schema validation
 
 // Rate Limiting
 const limiter = rateLimit({
@@ -123,8 +102,7 @@ const authLimiter = rateLimit({
 });
 
 app.use('/api/', limiter);
-app.use('/api/login', authLimiter);
-app.use('/api/login1', authLimiter); 
+app.use('/api/login', authLimiter); 
 
 // Serve static files từ uploads folder - PHẢI ĐẶT TRƯỚC ROUTES
 if (!fs.existsSync('uploads')){
@@ -302,6 +280,15 @@ const seedData = async () => {
 
 mongoose.connection.once('open', seedData);
 
+// Create Indexes for better performance
+OrderSchema.index({ tableId: 1, status: 1 });
+OrderSchema.index({ status: 1, paidAt: -1 });
+OrderSchema.index({ paidAt: 1 });
+RevenueSchema.index({ date: 1, month: 1 });
+AttendanceSchema.index({ staffId: 1, date: 1 }, { unique: true });
+CartSchema.index({ sessionId: 1 }, { unique: true });
+StaffSchema.index({ username: 1 }, { unique: true });
+
 // Helper Functions
 const validateInput = (data) => {
   if (!data.username || typeof data.username !== 'string' || data.username.length < 3) {
@@ -339,50 +326,80 @@ const updateRevenue = async (order) => {
     paidDate.setHours(0, 0, 0, 0);
     const monthStr = `${paidDate.getFullYear()}-${String(paidDate.getMonth() + 1).padStart(2, '0')}`;
 
-    // Update revenue cho ngày cụ thể
-    const revenue = await Revenue.findOne({ date: paidDate });
-    if (revenue) {
-      revenue.dailyRevenue += order.finalTotal;
-      revenue.dailyOrders += 1;
-      revenue.month = monthStr;
-      revenue.updatedAt = new Date();
-      await revenue.save();
-    } else {
-      await Revenue.create({
-        date: paidDate,
-        month: monthStr,
-        dailyRevenue: order.finalTotal,
-        dailyOrders: 1,
-        updatedAt: new Date()
-      });
-    }
+    // Cập nhật doanh thu ngày bằng aggregation (không load toàn bộ orders)
+    const dailyStats = await Order.aggregate([
+      {
+        $match: {
+          status: 'paid',
+          paidAt: { $gte: paidDate, $lt: new Date(paidDate.getTime() + 86400000) }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          revenue: { $sum: '$finalTotal' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
 
-    // Update revenue cho tháng - tính lại từ tất cả ngày trong tháng
+    const dailyRevenue = dailyStats[0]?.revenue || 0;
+    const dailyOrders = dailyStats[0]?.count || 0;
+
+    // Cập nhật doanh thu tháng
     const startOfMonth = new Date(paidDate.getFullYear(), paidDate.getMonth(), 1);
     const endOfMonth = new Date(paidDate.getFullYear(), paidDate.getMonth() + 1, 0);
     
-    const monthlyOrders = await Order.find({
-      status: 'paid',
-      paidAt: { $gte: startOfMonth, $lte: endOfMonth }
-    });
-    
-    const monthlyRevenue = monthlyOrders.reduce((sum, o) => sum + (o.finalTotal || 0), 0);
-    
-    // Cập nhật tất cả revenue records trong tháng
-    await Revenue.updateMany(
-      { month: monthStr },
-      { monthlyRevenue: monthlyRevenue, monthlyOrders: monthlyOrders.length }
-    );
+    const monthlyStats = await Order.aggregate([
+      {
+        $match: {
+          status: 'paid',
+          paidAt: { $gte: startOfMonth, $lte: endOfMonth }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          revenue: { $sum: '$finalTotal' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
 
-    // Update revenue tổng cộng
-    const totalOrders = await Order.find({ status: 'paid' });
-    const totalRevenue = totalOrders.reduce((sum, o) => sum + (o.finalTotal || 0), 0);
-    
-    await Revenue.updateMany(
-      {},
-      { totalRevenue: totalRevenue, totalOrders: totalOrders.length }
-    );
+    const monthlyRevenue = monthlyStats[0]?.revenue || 0;
+    const monthlyOrders = monthlyStats[0]?.count || 0;
 
+    // Cập nhật tổng doanh thu
+    const totalStats = await Order.aggregate([
+      { $match: { status: 'paid' } },
+      {
+        $group: {
+          _id: null,
+          revenue: { $sum: '$finalTotal' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const totalRevenue = totalStats[0]?.revenue || 0;
+    const totalOrders = totalStats[0]?.count || 0;
+
+    // Upsert revenue record cho ngày
+    await Revenue.findOneAndUpdate(
+      { date: paidDate },
+      {
+        date: paidDate,
+        month: monthStr,
+        dailyRevenue,
+        dailyOrders,
+        monthlyRevenue,
+        monthlyOrders,
+        totalRevenue,
+        totalOrders,
+        updatedAt: new Date()
+      },
+      { upsert: true, new: true }
+    );
   } catch (error) {
     console.error('Revenue update error:', error);
   }
@@ -430,11 +447,8 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Server is running', timestamp: new Date() });
 });
 
-// Login - Chính thức
+// Login
 app.post('/api/login', handleLogin);
-
-// Login - Dự phòng (cho các client cũ)
-app.post('/api/login1', handleLogin);
 
 // Init Data
 app.get('/api/init', async (req, res) => {
@@ -454,7 +468,7 @@ app.get('/api/init', async (req, res) => {
   }
 });
 
-// CRUD Generator - ĐÃ TỐI ƯU
+// CRUD Generator - TỐI ƯU: Emit thông tin cập nhật, không emit toàn bộ dữ liệu
 const createCrud = (Model, routeName, excludeRoutes = []) => {
   // GET all
   if (!excludeRoutes.includes('GET')) {
@@ -480,8 +494,8 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
         const n = new Model(req.body);
         await n.save();
         
-        // Emit socket event for real-time updates
-        io.emit(`${routeName}_updated`, await Model.find());
+        // Emit only the created item, not the entire collection
+        io.emit(`${routeName}_created`, n);
         
         res.status(201).json(n);
       } catch (e) {
@@ -511,7 +525,8 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
           return errorResponse(res, 404, 'Không tìm thấy dữ liệu');
         }
         
-        io.emit(`${routeName}_updated`, await Model.find());
+        // Emit only the updated item, not the entire collection
+        io.emit(`${routeName}_updated`, updated);
         res.json({ success: true, data: updated });
       } catch (e) {
         console.error(`Update ${routeName} error:`, e);
@@ -536,7 +551,8 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
           return errorResponse(res, 404, 'Không tìm thấy dữ liệu');
         }
         
-        io.emit(`${routeName}_updated`, await Model.find());
+        // Emit only the deleted item ID, not the entire collection
+        io.emit(`${routeName}_deleted`, { _id: deleted._id });
         res.json({ success: true, message: 'Đã xóa thành công' });
       } catch (e) {
         console.error(`Delete ${routeName} error:`, e);
@@ -546,12 +562,12 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
   }
 };
 
-// Apply CRUD routes - Quay về thuật toán cũ đơn giản
+// Apply CRUD routes
 createCrud(Menu, 'menu');
 createCrud(Table, 'tables');
 createCrud(Category, 'categories');
 
-// THÊM CHỨC NĂNG GET MENU BY ID ĐỂ TEST
+// GET menu by ID
 app.get('/api/menu/:id', async (req, res) => {
   try {
     if (!validateObjectId(req.params.id)) {
@@ -1018,8 +1034,8 @@ app.post('/api/orders', async (req, res) => {
       }
       await existingOrder.save();
       
-      const updatedOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
-      io.emit('orders_updated', updatedOrders);
+      // Emit only the updated order, not all orders
+      io.emit('order_updated', existingOrder);
       
       res.json(existingOrder);
     } else {
@@ -1031,8 +1047,8 @@ app.post('/api/orders', async (req, res) => {
       
       await newOrder.save();
       
-      const updatedOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
-      io.emit('orders_updated', updatedOrders);
+      // Emit only the new order, not all orders
+      io.emit('order_created', newOrder);
       
       res.status(201).json(newOrder);
     }
@@ -1059,9 +1075,9 @@ app.put('/api/orders/:orderId', async (req, res) => {
 
     // If items is empty, delete the order
     if (Array.isArray(items) && items.length === 0) {
-      await Order.findByIdAndDelete(orderId);
-      const updatedOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
-      io.emit('orders_updated', updatedOrders);
+      const deletedOrder = await Order.findByIdAndDelete(orderId);
+      // Emit only the deleted order ID
+      io.emit('order_deleted', { _id: deletedOrder._id });
       return res.json({ success: true, message: 'Đơn hàng đã được xóa' });
     }
 
@@ -1080,8 +1096,8 @@ app.put('/api/orders/:orderId', async (req, res) => {
 
     await order.save();
 
-    const updatedOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
-    io.emit('orders_updated', updatedOrders);
+    // Emit only the updated order, not all orders
+    io.emit('order_updated', order);
 
     res.json({ success: true, data: order });
   } catch (e) {
@@ -1104,8 +1120,8 @@ app.delete('/api/orders/:orderId', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Không tìm thấy đơn hàng' });
     }
 
-    const updatedOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
-    io.emit('orders_updated', updatedOrders);
+    // Emit only the deleted order ID, not all orders
+    io.emit('order_deleted', { _id: deleted._id });
 
     res.json({ success: true, message: 'Đơn hàng đã được xóa' });
   } catch (e) {
@@ -1146,8 +1162,8 @@ app.put('/api/orders/:orderId/items/:itemIdx', async (req, res) => {
     
     await order.save();
     
-    const updatedOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
-    io.emit('orders_updated', updatedOrders);
+    // Emit only the updated order, not all orders
+    io.emit('order_updated', order);
     
     res.json({ success: true });
   } catch (e) {
@@ -1200,8 +1216,8 @@ app.post('/api/pay', async (req, res) => {
       }
     }
 
-    const updatedOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
-    io.emit('orders_updated', updatedOrders);
+    // Emit orders updated instead of fetching all orders again
+    io.emit('orders_paid', { paidOrderIds: orderIds });
     
     res.json({ success: true, message: 'Thanh toán thành công' });
   } catch (e) {
@@ -1357,40 +1373,71 @@ app.get('/api/revenue/today', async (req, res) => {
     today.setHours(0, 0, 0, 0);
     const monthStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
 
-    const revenue = await Revenue.findOne({ date: today });
-    
-    if (revenue) {
-      res.json(revenue);
-    } else {
-      // Calculate from orders if no revenue record exists
-      const dailyOrders = await Order.find({
-        status: 'paid',
-        paidAt: { $gte: today, $lt: new Date(today.getTime() + 86400000) }
-      });
-      const dailyRevenue = dailyOrders.reduce((sum, o) => sum + (o.finalTotal || 0), 0);
+    // Dùng aggregation $facet thay vì 3 queries riêng
+    const stats = await Order.aggregate([
+      {
+        $facet: {
+          daily: [
+            {
+              $match: {
+                status: 'paid',
+                paidAt: { $gte: today, $lt: new Date(today.getTime() + 86400000) }
+              }
+            },
+            {
+              $group: {
+                _id: null,
+                revenue: { $sum: '$finalTotal' },
+                count: { $sum: 1 }
+              }
+            }
+          ],
+          monthly: [
+            {
+              $match: {
+                status: 'paid',
+                paidAt: {
+                  $gte: new Date(today.getFullYear(), today.getMonth(), 1),
+                  $lte: new Date(today.getFullYear(), today.getMonth() + 1, 0)
+                }
+              }
+            },
+            {
+              $group: {
+                _id: null,
+                revenue: { $sum: '$finalTotal' },
+                count: { $sum: 1 }
+              }
+            }
+          ],
+          total: [
+            { $match: { status: 'paid' } },
+            {
+              $group: {
+                _id: null,
+                revenue: { $sum: '$finalTotal' },
+                count: { $sum: 1 }
+              }
+            }
+          ]
+        }
+      }
+    ]);
 
-      const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
-      const endOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0);
-      const monthlyOrders = await Order.find({
-        status: 'paid',
-        paidAt: { $gte: startOfMonth, $lte: endOfMonth }
-      });
-      const monthlyRevenue = monthlyOrders.reduce((sum, o) => sum + (o.finalTotal || 0), 0);
+    const daily = stats[0]?.daily[0] || { revenue: 0, count: 0 };
+    const monthly = stats[0]?.monthly[0] || { revenue: 0, count: 0 };
+    const total = stats[0]?.total[0] || { revenue: 0, count: 0 };
 
-      const totalOrders = await Order.find({ status: 'paid' });
-      const totalRevenue = totalOrders.reduce((sum, o) => sum + (o.finalTotal || 0), 0);
-
-      res.json({
-        date: today,
-        month: monthStr,
-        dailyRevenue,
-        dailyOrders: dailyOrders.length,
-        monthlyRevenue,
-        monthlyOrders: monthlyOrders.length,
-        totalRevenue,
-        totalOrders: totalOrders.length
-      });
-    }
+    res.json({
+      date: today,
+      month: monthStr,
+      dailyRevenue: daily.revenue,
+      dailyOrders: daily.count,
+      monthlyRevenue: monthly.revenue,
+      monthlyOrders: monthly.count,
+      totalRevenue: total.revenue,
+      totalOrders: total.count
+    });
   } catch (e) {
     console.error('Revenue error:', e);
     res.status(500).json({ success: false, message: 'Lỗi khi tải doanh thu' });
@@ -1409,21 +1456,48 @@ app.get('/api/revenue/month', async (req, res) => {
     const startOfMonth = new Date(parseInt(year), parseInt(monthNum) - 1, 1);
     const endOfMonth = new Date(parseInt(year), parseInt(monthNum), 0);
 
-    const monthlyOrders = await Order.find({
-      status: 'paid',
-      paidAt: { $gte: startOfMonth, $lte: endOfMonth }
-    });
-    const monthlyRevenue = monthlyOrders.reduce((sum, o) => sum + (o.finalTotal || 0), 0);
+    // Dùng aggregation $facet
+    const stats = await Order.aggregate([
+      {
+        $facet: {
+          monthly: [
+            {
+              $match: {
+                status: 'paid',
+                paidAt: { $gte: startOfMonth, $lte: endOfMonth }
+              }
+            },
+            {
+              $group: {
+                _id: null,
+                revenue: { $sum: '$finalTotal' },
+                count: { $sum: 1 }
+              }
+            }
+          ],
+          total: [
+            { $match: { status: 'paid' } },
+            {
+              $group: {
+                _id: null,
+                revenue: { $sum: '$finalTotal' },
+                count: { $sum: 1 }
+              }
+            }
+          ]
+        }
+      }
+    ]);
 
-    const totalOrders = await Order.find({ status: 'paid' });
-    const totalRevenue = totalOrders.reduce((sum, o) => sum + (o.finalTotal || 0), 0);
+    const monthly = stats[0]?.monthly[0] || { revenue: 0, count: 0 };
+    const total = stats[0]?.total[0] || { revenue: 0, count: 0 };
 
     res.json({
       month,
-      monthlyRevenue,
-      monthlyOrders: monthlyOrders.length,
-      totalRevenue,
-      totalOrders: totalOrders.length
+      monthlyRevenue: monthly.revenue,
+      monthlyOrders: monthly.count,
+      totalRevenue: total.revenue,
+      totalOrders: total.count
     });
   } catch (e) {
     console.error('Monthly revenue error:', e);
@@ -1433,12 +1507,23 @@ app.get('/api/revenue/month', async (req, res) => {
 
 app.get('/api/revenue/total', async (req, res) => {
   try {
-    const totalOrders = await Order.find({ status: 'paid' });
-    const totalRevenue = totalOrders.reduce((sum, o) => sum + (o.finalTotal || 0), 0);
+    // Dùng aggregation thay vì find + reduce
+    const stats = await Order.aggregate([
+      { $match: { status: 'paid' } },
+      {
+        $group: {
+          _id: null,
+          revenue: { $sum: '$finalTotal' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const result = stats[0] || { revenue: 0, count: 0 };
 
     res.json({
-      totalRevenue,
-      totalOrders: totalOrders.length
+      totalRevenue: result.revenue,
+      totalOrders: result.count
     });
   } catch (e) {
     console.error('Total revenue error:', e);
@@ -1571,15 +1656,6 @@ app.use((req, res) => {
 });
 
 // Process Handlers
-process.on('uncaughtException', (e) => {
-  console.error('CRITICAL ERROR:', e);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
-// Start Server
 process.on('uncaughtException', (e) => {
   console.error('CRITICAL ERROR:', e);
 });
