@@ -13,6 +13,7 @@ const multer = require('multer');
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // CORS Configuration
@@ -1702,4 +1703,5 @@ const gracefulShutdown = () => {
 };
 
 process.on('SIGTERM', gracefulShutdown);
+
 process.on('SIGINT', gracefulShutdown);
