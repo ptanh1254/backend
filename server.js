@@ -1580,12 +1580,19 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // Start Server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+process.on('uncaughtException', (e) => {
+  console.error('CRITICAL ERROR:', e);
 });
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Start Server
+const PORT = process.env.PORT || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
+// CHỈ GIỮ LẠI ĐOẠN server.listen NÀY THÔI
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server đang chạy tại cổng ${PORT}`);
   console.log(`📋 Môi trường: ${NODE_ENV}`);
