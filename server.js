@@ -13,7 +13,6 @@ const multer = require('multer');
 require('dotenv').config();
 
 const app = express();
-app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // CORS Configuration
@@ -84,8 +83,6 @@ app.use(cors({
 
 app.use(express.json({ limit: '10kb' }));
 
-// Sanitization được xử lý bởi Express.json + MongoDB schema validation
-
 // Rate Limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -118,14 +115,13 @@ app.use('/uploads', express.static('uploads', {
   }
 }));
 
-// MongoDB Connection - Đã sửa lỗi options không được hỗ trợ
+// MongoDB Connection
 const MONGO_URI = process.env.MONGO_URI;
 if (!MONGO_URI) {
   console.error('❌ Lỗi: MONGO_URI chưa được set trong .env file');
   process.exit(1);
 }
 
-// Đã xóa useNewUrlParser và useUnifiedTopology vì không cần thiết trong mongoose 6+
 mongoose.connect(MONGO_URI, {
   serverSelectionTimeoutMS: 5000
 })
@@ -279,8 +275,6 @@ const seedData = async () => {
   }
 };
 
-mongoose.connection.once('open', seedData);
-
 // Create Indexes for better performance
 OrderSchema.index({ tableId: 1, status: 1 });
 OrderSchema.index({ status: 1, paidAt: -1 });
@@ -291,17 +285,16 @@ CartSchema.index({ sessionId: 1 }, { unique: true });
 StaffSchema.index({ username: 1 }, { unique: true });
 
 // Helper Functions
-const validateInput = (data) => {
-  if (!data.username || typeof data.username !== 'string' || data.username.length < 3) {
-    return 'Username phải có ít nhất 3 ký tự';
+// Emit tất cả orders đang hoạt động (không đã thanh toán)
+const emitAllOrders = async () => {
+  try {
+    const activeOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
+    io.emit('orders_updated', activeOrders);
+  } catch (error) {
+    console.error('Error emitting orders:', error);
   }
-  if (!data.password || typeof data.password !== 'string' || data.password.length < 6) {
-    return 'Password phải có ít nhất 6 ký tự';
-  }
-  return null;
 };
 
-// Hàm xử lý lỗi Mongoose validation
 const handleValidationError = (error) => {
   if (error.name === 'ValidationError') {
     const messages = Object.values(error.errors).map(err => err.message);
@@ -327,7 +320,6 @@ const updateRevenue = async (order) => {
     paidDate.setHours(0, 0, 0, 0);
     const monthStr = `${paidDate.getFullYear()}-${String(paidDate.getMonth() + 1).padStart(2, '0')}`;
 
-    // Cập nhật doanh thu ngày bằng aggregation (không load toàn bộ orders)
     const dailyStats = await Order.aggregate([
       {
         $match: {
@@ -347,7 +339,6 @@ const updateRevenue = async (order) => {
     const dailyRevenue = dailyStats[0]?.revenue || 0;
     const dailyOrders = dailyStats[0]?.count || 0;
 
-    // Cập nhật doanh thu tháng
     const startOfMonth = new Date(paidDate.getFullYear(), paidDate.getMonth(), 1);
     const endOfMonth = new Date(paidDate.getFullYear(), paidDate.getMonth() + 1, 0);
     
@@ -370,7 +361,6 @@ const updateRevenue = async (order) => {
     const monthlyRevenue = monthlyStats[0]?.revenue || 0;
     const monthlyOrders = monthlyStats[0]?.count || 0;
 
-    // Cập nhật tổng doanh thu
     const totalStats = await Order.aggregate([
       { $match: { status: 'paid' } },
       {
@@ -385,7 +375,6 @@ const updateRevenue = async (order) => {
     const totalRevenue = totalStats[0]?.revenue || 0;
     const totalOrders = totalStats[0]?.count || 0;
 
-    // Upsert revenue record cho ngày
     await Revenue.findOneAndUpdate(
       { date: paidDate },
       {
@@ -442,16 +431,8 @@ const handleLogin = async (req, res) => {
 };
 
 // Routes
-
-// Health Check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Server is running', timestamp: new Date() });
-});
-
-// Login
 app.post('/api/login', handleLogin);
 
-// Init Data
 app.get('/api/init', async (req, res) => {
   try {
     const [tables, menu, categories, activeOrders, settings] = await Promise.all([
@@ -469,9 +450,8 @@ app.get('/api/init', async (req, res) => {
   }
 });
 
-// CRUD Generator - TỐI ƯU: Emit thông tin cập nhật, không emit toàn bộ dữ liệu
+// CRUD Generator
 const createCrud = (Model, routeName, excludeRoutes = []) => {
-  // GET all
   if (!excludeRoutes.includes('GET')) {
     app.get(`/api/${routeName}`, async (req, res) => {
       try {
@@ -484,7 +464,6 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
     });
   }
 
-  // POST create
   if (!excludeRoutes.includes('POST')) {
     app.post(`/api/${routeName}`, async (req, res) => {
       try {
@@ -495,9 +474,7 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
         const n = new Model(req.body);
         await n.save();
         
-        // Emit only the created item, not the entire collection
         io.emit(`${routeName}_created`, n);
-        
         res.status(201).json(n);
       } catch (e) {
         console.error(`Create ${routeName} error:`, e);
@@ -508,7 +485,6 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
     });
   }
 
-  // PUT update
   if (!excludeRoutes.includes('PUT')) {
     app.put(`/api/${routeName}/:id`, async (req, res) => {
       try {
@@ -526,7 +502,6 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
           return errorResponse(res, 404, 'Không tìm thấy dữ liệu');
         }
         
-        // Emit only the updated item, not the entire collection
         io.emit(`${routeName}_updated`, updated);
         res.json({ success: true, data: updated });
       } catch (e) {
@@ -538,7 +513,6 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
     });
   }
 
-  // DELETE
   if (!excludeRoutes.includes('DELETE')) {
     app.delete(`/api/${routeName}/:id`, async (req, res) => {
       try {
@@ -552,7 +526,6 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
           return errorResponse(res, 404, 'Không tìm thấy dữ liệu');
         }
         
-        // Emit only the deleted item ID, not the entire collection
         io.emit(`${routeName}_deleted`, { _id: deleted._id });
         res.json({ success: true, message: 'Đã xóa thành công' });
       } catch (e) {
@@ -627,7 +600,6 @@ app.post('/api/staff', async (req, res) => {
 
     await staff.save();
     
-    // Return without password
     const staffResponse = staff.toObject();
     delete staffResponse.password;
     
@@ -650,7 +622,6 @@ app.put('/api/staff/:id', async (req, res) => {
 
     const updateData = { name, role: role || 'staff' };
 
-    // If username is being updated, check for duplicates
     if (username) {
       const existing = await Staff.findOne({ username, _id: { $ne: req.params.id } });
       if (existing) {
@@ -659,7 +630,6 @@ app.put('/api/staff/:id', async (req, res) => {
       updateData.username = username;
     }
 
-    // If password is provided, hash it
     if (password && password.length > 0) {
       const salt = await bcrypt.genSalt(10);
       updateData.password = await bcrypt.hash(password, salt);
@@ -690,7 +660,6 @@ app.delete('/api/staff/:id', async (req, res) => {
       return errorResponse(res, 400, 'ID không hợp lệ');
     }
 
-    // Don't allow deleting the last admin
     const staffToDelete = await Staff.findById(req.params.id);
     if (staffToDelete && staffToDelete.role === 'admin') {
       const adminCount = await Staff.countDocuments({ role: 'admin' });
@@ -719,10 +688,7 @@ const getClientIp = (req) => {
 };
 
 const isIpAllowed = (ip) => {
-  // THÊM DÒNG NÀY: Nếu danh sách có chứa dấu * thì luôn cho phép (trả về true)
-  if (ALLOWED_IPS.includes('*')) return true; 
-
-  // Giữ nguyên logic cũ cho các trường hợp khác
+  if (ALLOWED_IPS.includes('*')) return true;
   return ALLOWED_IPS.some(allowed => {
     if (allowed === 'localhost') return ip === '::1' || ip === '127.0.0.1';
     return ip.includes(allowed.trim());
@@ -997,7 +963,6 @@ app.post('/api/orders', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Dữ liệu đơn hàng không hợp lệ' });
     }
 
-    // Validate items
     for (const item of items) {
       if (!item.name || !item.price || !item.quantity) {
         return res.status(400).json({ success: false, message: 'Thông tin mặt hàng không hợp lệ' });
@@ -1016,7 +981,6 @@ app.post('/api/orders', async (req, res) => {
       status: item.status || 'new'
     }));
 
-    // Delete empty orders for this table first
     await Order.deleteMany({ 
       tableId: tableId, 
       items: { $size: 0 },
@@ -1035,9 +999,7 @@ app.post('/api/orders', async (req, res) => {
       }
       await existingOrder.save();
       
-      // Emit only the updated order, not all orders
-      io.emit('order_updated', existingOrder);
-      
+      await emitAllOrders();
       res.json(existingOrder);
     } else {
       const newOrder = new Order({ 
@@ -1048,9 +1010,7 @@ app.post('/api/orders', async (req, res) => {
       
       await newOrder.save();
       
-      // Emit only the new order, not all orders
-      io.emit('order_created', newOrder);
-      
+      await emitAllOrders();
       res.status(201).json(newOrder);
     }
   } catch (e) {
@@ -1074,15 +1034,12 @@ app.put('/api/orders/:orderId', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Không tìm thấy đơn hàng' });
     }
 
-    // If items is empty, delete the order
     if (Array.isArray(items) && items.length === 0) {
       const deletedOrder = await Order.findByIdAndDelete(orderId);
-      // Emit only the deleted order ID
-      io.emit('order_deleted', { _id: deletedOrder._id });
+      await emitAllOrders();
       return res.json({ success: true, message: 'Đơn hàng đã được xóa' });
     }
 
-    // Update items - bảo đảm tất cả items có _id
     if (Array.isArray(items)) {
       order.items = items.map(item => ({
         ...item,
@@ -1090,15 +1047,13 @@ app.put('/api/orders/:orderId', async (req, res) => {
       }));
     }
 
-    // Update status if provided
     if (status) {
       order.status = status;
     }
 
     await order.save();
 
-    // Emit only the updated order, not all orders
-    io.emit('order_updated', order);
+    await emitAllOrders();
 
     res.json({ success: true, data: order });
   } catch (e) {
@@ -1121,8 +1076,7 @@ app.delete('/api/orders/:orderId', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Không tìm thấy đơn hàng' });
     }
 
-    // Emit only the deleted order ID, not all orders
-    io.emit('order_deleted', { _id: deleted._id });
+    await emitAllOrders();
 
     res.json({ success: true, message: 'Đơn hàng đã được xóa' });
   } catch (e) {
@@ -1155,7 +1109,6 @@ app.put('/api/orders/:orderId/items/:itemIdx', async (req, res) => {
 
     order.items[itemIdx].status = status;
     
-    // Check if all items are served
     const allItemsServed = order.items.every(item => item.status === 'served');
     if (allItemsServed) {
       order.status = 'served';
@@ -1163,8 +1116,7 @@ app.put('/api/orders/:orderId/items/:itemIdx', async (req, res) => {
     
     await order.save();
     
-    // Emit only the updated order, not all orders
-    io.emit('order_updated', order);
+    await emitAllOrders();
     
     res.json({ success: true });
   } catch (e) {
@@ -1197,7 +1149,6 @@ app.post('/api/pay', async (req, res) => {
 
     paymentMethod = methodMap[paymentMethod];
 
-    // Process each order
     for (const orderId of orderIds) {
       if (!mongoose.Types.ObjectId.isValid(orderId)) {
         return res.status(400).json({ success: false, message: 'Order ID không hợp lệ' });
@@ -1212,13 +1163,11 @@ app.post('/api/pay', async (req, res) => {
         order.finalTotal = total;
         await order.save();
 
-        // Update revenue
         await updateRevenue(order);
       }
     }
 
-    // Emit orders updated instead of fetching all orders again
-    io.emit('orders_paid', { paidOrderIds: orderIds });
+    await emitAllOrders();
     
     res.json({ success: true, message: 'Thanh toán thành công' });
   } catch (e) {
@@ -1256,7 +1205,6 @@ app.post('/api/cart/:sessionId/add', async (req, res) => {
       cart = new Cart({ sessionId, items: [] });
     }
 
-    // Kiểm tra item đã có trong giỏ
     const existingItem = cart.items.find(i => i._id?.toString() === item._id?.toString());
     if (existingItem) {
       existingItem.quantity += (item.quantity || 1);
@@ -1597,15 +1545,6 @@ app.post('/api/settings', async (req, res) => {
   }
 });
 
-// Health Check
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
-  });
-});
-
 // Socket.IO
 io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
@@ -1634,7 +1573,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Error Handlers
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
@@ -1651,12 +1589,10 @@ app.use((err, req, res, next) => {
   next();
 });
 
-// 404 Handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint không tồn tại' });
 });
 
-// Process Handlers
 process.on('uncaughtException', (e) => {
   console.error('CRITICAL ERROR:', e);
 });
@@ -1665,11 +1601,8 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-// Start Server
 const PORT = process.env.PORT || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
-
-// CHỈ GIỮ LẠI ĐOẠN server.listen NÀY THÔI
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server đang chạy tại cổng ${PORT}`);
   console.log(`📋 Môi trường: ${NODE_ENV}`);
@@ -1678,7 +1611,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`📁 Upload folder: ${path.join(process.cwd(), 'uploads')}`);
 });
 
-// Graceful Shutdown
 const gracefulShutdown = () => {
   console.log('🔄 Nhận tín hiệu shutdown, đang đóng kết nối...');
   
@@ -1695,7 +1627,6 @@ const gracefulShutdown = () => {
     }
   });
 
-  // Force close after 10 seconds
   setTimeout(() => {
     console.error('❌ Buộc đóng do timeout');
     process.exit(1);
@@ -1703,5 +1634,4 @@ const gracefulShutdown = () => {
 };
 
 process.on('SIGTERM', gracefulShutdown);
-
 process.on('SIGINT', gracefulShutdown);
