@@ -1484,7 +1484,14 @@ const upload = multer({
 });
 
 // Upload endpoint
-app.post('/api/upload', upload.single('image'), (req, res) => {
+app.post('/api/upload', (req, res, next) => {
+  // Set CORS headers trước upload
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+}, upload.single('image'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, error: 'Chưa chọn file ảnh' });
   }
