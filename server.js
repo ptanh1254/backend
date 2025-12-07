@@ -15,43 +15,13 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// CORS Configuration
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:5173,http://192.168.1.87:5173')
-  .split(',')
-  .map(origin => origin.trim())
-  .filter(origin => {
-    if (/\s/.test(origin)) return false;
-    return true;
-  });
-
-if (!allowedOrigins.includes('http://localhost:5000')) {
-  allowedOrigins.push('http://localhost:5000');
-}
-
-// Function to check if origin is from local network
-const isLocalNetworkOrigin = (origin) => {
-  if (!origin) return true;
-  // Allow localhost
-  if (origin.includes('localhost') || origin.includes('127.0.0.1') || origin.includes('::1')) return true;
-  // Allow 192.168.x.x (private network)
-  if (/https?:\/\/192\.168\.\d+\.\d+/.test(origin)) return true;
-  // Allow 10.x.x.x (private network)
-  if (/https?:\/\/10\.\d+\.\d+\.\d+/.test(origin)) return true;
-  // Allow 172.16-31.x.x (private network)
-  if (/https?:\/\/172\.(1[6-9]|2\d|3[01])\.\d+\.\d+/.test(origin)) return true;
-  return allowedOrigins.includes(origin);
-};
+// CORS Configuration - Allow all origins and IPs
+const allowAllOrigins = true;
+const allowedOrigins = ['*']; // For logging
 
 const io = new Server(server, {
   cors: {
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (isLocalNetworkOrigin(origin)) {
-        return callback(null, true);
-      } else {
-        return callback(new Error('Not allowed by CORS'));
-      }
-    },
+    origin: '*',
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true
   }
@@ -74,15 +44,7 @@ app.use(helmet({
 }));
 
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (isLocalNetworkOrigin(origin)) {
-      return callback(null, true);
-    } else {
-      console.log(`🚫 CORS blocked: ${origin}`);
-      return callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: '*',
   credentials: true,
   optionsSuccessStatus: 200
 }));
@@ -301,9 +263,6 @@ OrderSchema.index({ tableId: 1, status: 1 });
 OrderSchema.index({ status: 1, paidAt: -1 });
 OrderSchema.index({ paidAt: 1 });
 RevenueSchema.index({ date: 1, month: 1 });
-AttendanceSchema.index({ staffId: 1, date: 1 }, { unique: true });
-CartSchema.index({ sessionId: 1 }, { unique: true });
-StaffSchema.index({ username: 1 }, { unique: true });
 
 // Helper Functions
 // Emit tất cả orders đang hoạt động (không đã thanh toán)
