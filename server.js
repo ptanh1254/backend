@@ -213,6 +213,7 @@ const OrderSchema = new mongoose.Schema({
     name: String,
     price: { type: Number, min: 0 },
     quantity: { type: Number, min: 1 },
+    note: String, // Ghi chú cho từng món
     status: { type: String, default: 'new', enum: ['new', 'cooking', 'served'] }
   }],
   note: String,
@@ -237,6 +238,19 @@ const CartSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
+// Session Schema - Lưu active sessions
+const SessionSchema = new mongoose.Schema({
+  staffId: { type: mongoose.Schema.Types.ObjectId, ref: 'Staff', required: true },
+  socketId: { type: String, required: true },
+  ipAddress: String,
+  userAgent: String,
+  connectedAt: { type: Date, default: Date.now },
+  lastActivity: { type: Date, default: Date.now }
+});
+
+SessionSchema.index({ staffId: 1 });
+SessionSchema.index({ connectedAt: 1 }, { expireAfterSeconds: 3600 }); // Auto remove after 1 hour
+
 // Models
 const Setting = mongoose.model('Setting', SettingSchema);
 const Category = mongoose.model('Category', CategorySchema);
@@ -245,6 +259,7 @@ const Table = mongoose.model('Table', TableSchema);
 const Staff = mongoose.model('Staff', StaffSchema);
 const Attendance = mongoose.model('Attendance', AttendanceSchema);
 const Revenue = mongoose.model('Revenue', RevenueSchema);
+const Session = mongoose.model('Session', SessionSchema);
 const Order = mongoose.model('Order', OrderSchema);
 const Cart = mongoose.model('Cart', CartSchema);
 
@@ -978,7 +993,8 @@ app.post('/api/orders', async (req, res) => {
     const itemsWithStatus = items.map(item => ({
       ...item,
       _id: item._id || new mongoose.Types.ObjectId(),
-      status: item.status || 'new'
+      status: item.status || 'new',
+      note: item.note || ''
     }));
 
     await Order.deleteMany({ 
@@ -1549,8 +1565,59 @@ app.post('/api/settings', async (req, res) => {
 io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
 
-  socket.on('disconnect', () => {
+  // Register user session
+  socket.on('user_login', async (data) => {
+    try {
+      const { staffId, userAgent } = data;
+      const ipAddress = socket.handshake.headers['x-forwarded-for']?.split(',')[0] || 
+                       socket.handshake.address || 
+                       'unknown';
+
+      // Check if user has other active sessions
+      const existingSessions = await Session.find({ staffId });
+      
+      if (existingSessions.length > 0) {
+        // Notify other sessions that this user logged in elsewhere
+        existingSessions.forEach(session => {
+          io.to(session.socketId).emit('session_conflict', {
+            message: 'Tài khoản này đang được đăng nhập ở nơi khác',
+            newLoginLocation: ipAddress,
+            timestamp: new Date()
+          });
+        });
+        
+        // Remove old sessions
+        await Session.deleteMany({ staffId });
+      }
+
+      // Create new session
+      const newSession = new Session({
+        staffId,
+        socketId: socket.id,
+        ipAddress,
+        userAgent,
+        connectedAt: new Date(),
+        lastActivity: new Date()
+      });
+      
+      await newSession.save();
+      socket.staffId = staffId;
+      socket.emit('session_registered', { success: true });
+    } catch (error) {
+      console.error('User login error:', error);
+      socket.emit('session_error', { message: 'Lỗi đăng ký phiên' });
+    }
+  });
+
+  socket.on('disconnect', async () => {
     console.log('❌ Client disconnected:', socket.id);
+    try {
+      if (socket.staffId) {
+        await Session.deleteOne({ socketId: socket.id });
+      }
+    } catch (error) {
+      console.error('Disconnect error:', error);
+    }
   });
 
   socket.on('error', (error) => {
