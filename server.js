@@ -63,7 +63,13 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'self'"],
       imgSrc: ["'self'", "data:", "http:", "https:", "*"],
+      upgradeInsecureRequests: [],
     }
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
   }
 }));
 
