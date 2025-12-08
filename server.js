@@ -1246,6 +1246,10 @@ app.post('/api/cart/:sessionId/add', async (req, res) => {
 
     cart.updatedAt = new Date();
     await cart.save();
+    
+    // Emit cart update to all connected clients
+    io.emit('cart_updated', { sessionId, items: cart.items });
+    
     res.json({ success: true, data: cart });
   } catch (e) {
     console.error('Add to cart error:', e);
@@ -1273,6 +1277,7 @@ app.put('/api/cart/:sessionId/update/:itemId', async (req, res) => {
 
     cart.updatedAt = new Date();
     await cart.save();
+    io.emit('cart_updated', { sessionId, items: cart.items });
     res.json({ success: true, data: cart });
   } catch (e) {
     console.error('Update cart error:', e);
@@ -1292,6 +1297,7 @@ app.delete('/api/cart/:sessionId/remove/:itemId', async (req, res) => {
     cart.items = cart.items.filter(i => i._id?.toString() !== itemId);
     cart.updatedAt = new Date();
     await cart.save();
+    io.emit('cart_updated', { sessionId, items: cart.items });
     res.json({ success: true, data: cart });
   } catch (e) {
     console.error('Remove from cart error:', e);
@@ -1306,6 +1312,7 @@ app.delete('/api/cart/:sessionId/clear', async (req, res) => {
     if (!sessionId) return res.status(400).json({ success: false, message: 'SessionId không hợp lệ' });
 
     await Cart.deleteOne({ sessionId });
+    io.emit('cart_updated', { sessionId, items: [] });
     res.json({ success: true, message: 'Giỏ hàng đã được xóa' });
   } catch (e) {
     console.error('Clear cart error:', e);
