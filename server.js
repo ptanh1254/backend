@@ -41,7 +41,12 @@ const io = new Server(server, {
     origin: '*',
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true
-  }
+  },
+  transports: ['websocket', 'polling'],
+  pingInterval: 25000,
+  pingTimeout: 20000,
+  allowUpgrades: true,
+  maxHttpBufferSize: 1e6
 });
 
 // Security Middleware
