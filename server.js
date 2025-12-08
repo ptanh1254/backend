@@ -175,12 +175,14 @@ const AttendanceSchema = new mongoose.Schema({
   date: { type: Date, required: true },
   checkInTime: Date,
   checkOutTime: Date,
+  shiftNumber: { type: Number, default: 1 }, // Để hỗ trợ nhiều ca trong 1 ngày
   ipAddress: String,
   status: { type: String, enum: ['present', 'absent', 'late'], default: 'absent' },
   createdAt: { type: Date, default: Date.now }
 });
 
-AttendanceSchema.index({ staffId: 1, date: 1 }, { unique: true });
+// Loại bỏ unique constraint trên date để cho phép nhiều ca trong 1 ngày
+AttendanceSchema.index({ staffId: 1, date: 1, shiftNumber: 1 });
 
 const RevenueSchema = new mongoose.Schema({
   date: { type: Date, required: true, unique: true },
@@ -727,27 +729,36 @@ app.post('/api/attendance/checkin', async (req, res) => {
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
-    let attendance = await Attendance.findOne({
+    // Kiểm tra xem có ca làm việc chưa kết thúc không
+    let activeAttendance = await Attendance.findOne({
       staffId,
-      date: { $gte: today, $lt: tomorrow }
+      date: { $gte: today, $lt: tomorrow },
+      checkInTime: { $exists: true },
+      checkOutTime: null
     });
 
-    if (!attendance) {
-      attendance = new Attendance({
-        staffId,
-        staffName: staff.name,
-        date: new Date(),
-        checkInTime: new Date(),
-        ipAddress: clientIp,
-        status: 'present'
-      });
-    } else if (attendance.checkInTime) {
-      return errorResponse(res, 400, 'Bạn đã điểm danh hôm nay rồi');
-    } else {
-      attendance.checkInTime = new Date();
-      attendance.status = 'present';
-      attendance.ipAddress = clientIp;
+    if (activeAttendance) {
+      return errorResponse(res, 400, 'Bạn đã điểm danh và chưa kết thúc ca làm việc');
     }
+
+    // Tìm số ca tiếp theo
+    const lastShift = await Attendance.findOne({
+      staffId,
+      date: { $gte: today, $lt: tomorrow }
+    }).sort({ shiftNumber: -1 });
+
+    const nextShiftNumber = (lastShift?.shiftNumber || 0) + 1;
+
+    // Tạo ca mới
+    let attendance = new Attendance({
+      staffId,
+      staffName: staff.name,
+      date: new Date(),
+      checkInTime: new Date(),
+      shiftNumber: nextShiftNumber,
+      ipAddress: clientIp,
+      status: 'present'
+    });
 
     await attendance.save();
     
@@ -783,13 +794,16 @@ app.post('/api/attendance/checkout', async (req, res) => {
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
+    // Tìm ca làm việc hoạt động (chưa checkout)
     const attendance = await Attendance.findOne({
       staffId,
-      date: { $gte: today, $lt: tomorrow }
+      date: { $gte: today, $lt: tomorrow },
+      checkInTime: { $exists: true },
+      checkOutTime: null
     });
 
     if (!attendance) {
-      return errorResponse(res, 404, 'Chưa điểm danh hôm nay');
+      return errorResponse(res, 404, 'Không tìm thấy ca làm việc hoạt động');
     }
 
     attendance.checkOutTime = new Date();
