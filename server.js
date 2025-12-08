@@ -9,11 +9,28 @@ const fs = require('fs');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
+
+// ✓ TỐI ƯU: Thêm cache đơn giản cho settings
+let settingsCache = null;
+let settingsCacheTime = 0;
+const SETTINGS_CACHE_DURATION = 5 * 60 * 1000; // 5 phút
+
+const getCachedSettings = async () => {
+  const now = Date.now();
+  if (settingsCache && (now - settingsCacheTime) < SETTINGS_CACHE_DURATION) {
+    return settingsCache;
+  }
+  settingsCache = await Setting.findOne().lean();
+  settingsCacheTime = now;
+  return settingsCache;
+};
 
 // CORS Configuration - Allow all origins and IPs
 const allowAllOrigins = true;
@@ -262,13 +279,20 @@ const seedData = async () => {
 OrderSchema.index({ tableId: 1, status: 1 });
 OrderSchema.index({ status: 1, paidAt: -1 });
 OrderSchema.index({ paidAt: 1 });
+OrderSchema.index({ status: 1 }); // ✓ TỐI ƯU: Thêm index cho status
 RevenueSchema.index({ date: 1, month: 1 });
+MenuSchema.index({ categoryId: 1, status: 1 }); // ✓ TỐI ƯU: Thêm index cho category filter
+AttendanceSchema.index({ staffId: 1, date: 1 }); // ✓ TỐI ƯU: Đã có, giữ nguyên
+AttendanceSchema.index({ date: 1 }); // ✓ TỐI ƯU: Thêm index cho date queries
 
 // Helper Functions
 // Emit tất cả orders đang hoạt động (không đã thanh toán)
 const emitAllOrders = async () => {
   try {
-    const activeOrders = await Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 });
+    const activeOrders = await Order.find({ status: { $ne: 'paid' } })
+      .sort({ createdAt: 1 })
+      .lean() // ✓ TỐI ƯU: Dùng lean() để không tạo Mongoose documents
+      .select('-__v'); // Bỏ field không cần thiết
     io.emit('orders_updated', activeOrders);
   } catch (error) {
     console.error('Error emitting orders:', error);
@@ -300,72 +324,54 @@ const updateRevenue = async (order) => {
     paidDate.setHours(0, 0, 0, 0);
     const monthStr = `${paidDate.getFullYear()}-${String(paidDate.getMonth() + 1).padStart(2, '0')}`;
 
-    const dailyStats = await Order.aggregate([
-      {
-        $match: {
-          status: 'paid',
-          paidAt: { $gte: paidDate, $lt: new Date(paidDate.getTime() + 86400000) }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          revenue: { $sum: '$finalTotal' },
-          count: { $sum: 1 }
-        }
-      }
-    ]);
-
-    const dailyRevenue = dailyStats[0]?.revenue || 0;
-    const dailyOrders = dailyStats[0]?.count || 0;
-
     const startOfMonth = new Date(paidDate.getFullYear(), paidDate.getMonth(), 1);
     const endOfMonth = new Date(paidDate.getFullYear(), paidDate.getMonth() + 1, 0);
-    
-    const monthlyStats = await Order.aggregate([
+
+    // ✓ TỐI ƯU: Dùng $facet để gộp 3 queries thành 1
+    const stats = await Order.aggregate([
       {
-        $match: {
-          status: 'paid',
-          paidAt: { $gte: startOfMonth, $lte: endOfMonth }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          revenue: { $sum: '$finalTotal' },
-          count: { $sum: 1 }
+        $facet: {
+          daily: [
+            {
+              $match: {
+                status: 'paid',
+                paidAt: { $gte: paidDate, $lt: new Date(paidDate.getTime() + 86400000) }
+              }
+            },
+            { $group: { _id: null, revenue: { $sum: '$finalTotal' }, count: { $sum: 1 } } }
+          ],
+          monthly: [
+            {
+              $match: {
+                status: 'paid',
+                paidAt: { $gte: startOfMonth, $lte: endOfMonth }
+              }
+            },
+            { $group: { _id: null, revenue: { $sum: '$finalTotal' }, count: { $sum: 1 } } }
+          ],
+          total: [
+            { $match: { status: 'paid' } },
+            { $group: { _id: null, revenue: { $sum: '$finalTotal' }, count: { $sum: 1 } } }
+          ]
         }
       }
     ]);
 
-    const monthlyRevenue = monthlyStats[0]?.revenue || 0;
-    const monthlyOrders = monthlyStats[0]?.count || 0;
-
-    const totalStats = await Order.aggregate([
-      { $match: { status: 'paid' } },
-      {
-        $group: {
-          _id: null,
-          revenue: { $sum: '$finalTotal' },
-          count: { $sum: 1 }
-        }
-      }
-    ]);
-
-    const totalRevenue = totalStats[0]?.revenue || 0;
-    const totalOrders = totalStats[0]?.count || 0;
+    const daily = stats[0]?.daily[0] || { revenue: 0, count: 0 };
+    const monthly = stats[0]?.monthly[0] || { revenue: 0, count: 0 };
+    const total = stats[0]?.total[0] || { revenue: 0, count: 0 };
 
     await Revenue.findOneAndUpdate(
       { date: paidDate },
       {
         date: paidDate,
         month: monthStr,
-        dailyRevenue,
-        dailyOrders,
-        monthlyRevenue,
-        monthlyOrders,
-        totalRevenue,
-        totalOrders,
+        dailyRevenue: daily.revenue,
+        dailyOrders: daily.count,
+        monthlyRevenue: monthly.revenue,
+        monthlyOrders: monthly.count,
+        totalRevenue: total.revenue,
+        totalOrders: total.count,
         updatedAt: new Date()
       },
       { upsert: true, new: true }
@@ -415,12 +421,13 @@ app.post('/api/login', handleLogin);
 
 app.get('/api/init', async (req, res) => {
   try {
+    // ✓ TỐI ƯU: Dùng lean() và bỏ __v field, select fields cần thiết
     const [tables, menu, categories, activeOrders, settings] = await Promise.all([
-      Table.find().sort({ name: 1 }),
-      Menu.find(),
-      Category.find().sort({ order: 1 }),
-      Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 }),
-      Setting.findOne()
+      Table.find().sort({ name: 1 }).lean(),
+      Menu.find().lean().select('-__v'),
+      Category.find().sort({ order: 1 }).lean(),
+      Order.find({ status: { $ne: 'paid' } }).sort({ createdAt: 1 }).lean().select('-__v'),
+      getCachedSettings() // ✓ TỐI ƯU: Dùng cache
     ]);
     
     res.json({ tables, menu, categories, activeOrders, settings });
@@ -435,7 +442,8 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
   if (!excludeRoutes.includes('GET')) {
     app.get(`/api/${routeName}`, async (req, res) => {
       try {
-        const data = await Model.find();
+        // ✓ TỐI ƯU: Dùng lean() cho GET queries
+        const data = await Model.find().lean();
         res.json(data);
       } catch (e) {
         console.error(`Get ${routeName} error:`, e);
@@ -472,6 +480,15 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
           return errorResponse(res, 400, 'ID không hợp lệ');
         }
         
+        // Special handling for Menu items with image
+        if (routeName === 'menu' && req.body.image) {
+          const oldItem = await Model.findById(req.params.id);
+          if (oldItem && oldItem.image && oldItem.image !== req.body.image) {
+            // Old image exists and is different from new one
+            await deleteImageFromCloudinary(oldItem.image);
+          }
+        }
+        
         const updated = await Model.findByIdAndUpdate(
           req.params.id, 
           req.body, 
@@ -504,6 +521,11 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
         
         if (!deleted) {
           return errorResponse(res, 404, 'Không tìm thấy dữ liệu');
+        }
+        
+        // Special handling for Menu items - delete associated image
+        if (routeName === 'menu' && deleted.image) {
+          await deleteImageFromCloudinary(deleted.image);
         }
         
         io.emit(`${routeName}_deleted`, { _id: deleted._id });
@@ -543,7 +565,8 @@ app.get('/api/menu/:id', async (req, res) => {
 // Staff Management
 app.get('/api/staff', async (req, res) => {
   try {
-    const staff = await Staff.find().select('-password');
+    // ✓ TỐI ƯU: Bỏ password field và dùng lean()
+    const staff = await Staff.find().select('-password').lean();
     res.json(staff);
   } catch (e) {
     console.error('Get staff error:', e);
@@ -832,49 +855,67 @@ app.get('/api/attendance/stats/monthly', async (req, res) => {
 
     const startDate = new Date(parseInt(year), parseInt(month) - 1, 1);
     const endDate = new Date(parseInt(year), parseInt(month), 1);
-
-    const attendance = await Attendance.find({
-      date: { $gte: startDate, $lt: endDate }
-    }).populate('staffId', 'name username role');
-
-    // Tính toán thống kê
-    const stats = {};
     const daysInMonth = new Date(parseInt(year), parseInt(month), 0).getDate();
 
-    // Lấy tất cả nhân viên
-    const allStaff = await Staff.find().select('_id name username role');
-    
-    allStaff.forEach(staff => {
-      const staffAttendance = attendance.filter(a => a.staffId._id.toString() === staff._id.toString());
-      
-      const present = staffAttendance.filter(a => a.status === 'present').length;
-      const absent = daysInMonth - staffAttendance.length;
-      const late = staffAttendance.filter(a => a.status === 'late').length;
-      
-      const totalHours = staffAttendance.reduce((sum, a) => {
-        if (a.checkInTime && a.checkOutTime) {
-          return sum + (a.checkOutTime - a.checkInTime) / (1000 * 60 * 60);
+    // ✓ TỐI ƯU: Dùng aggregation pipeline thay vì N+1 queries
+    const stats = await Attendance.aggregate([
+      {
+        $match: {
+          date: { $gte: startDate, $lt: endDate }
         }
-        return sum;
-      }, 0);
-
-      stats[staff._id] = {
-        staffId: staff._id,
-        name: staff.name,
-        username: staff.username,
-        role: staff.role,
-        present,
-        absent,
-        late,
-        totalHours: Math.round(totalHours * 10) / 10,
-        attendanceRate: Math.round((present / daysInMonth) * 100) + '%'
-      };
-    });
+      },
+      {
+        $group: {
+          _id: '$staffId',
+          present: { $sum: { $cond: [{ $eq: ['$status', 'present'] }, 1, 0] } },
+          late: { $sum: { $cond: [{ $eq: ['$status', 'late'] }, 1, 0] } },
+          totalDays: { $sum: 1 },
+          totalHours: {
+            $sum: {
+              $cond: [
+                { $and: ['$checkInTime', '$checkOutTime'] },
+                { $divide: [{ $subtract: ['$checkOutTime', '$checkInTime'] }, 3600000] },
+                0
+              ]
+            }
+          }
+        }
+      },
+      {
+        $lookup: {
+          from: 'staffs',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'staffInfo'
+        }
+      },
+      {
+        $unwind: '$staffInfo'
+      },
+      {
+        $project: {
+          staffId: '$_id',
+          name: '$staffInfo.name',
+          username: '$staffInfo.username',
+          role: '$staffInfo.role',
+          present: 1,
+          late: 1,
+          absent: { $subtract: [daysInMonth, '$totalDays'] },
+          totalHours: { $round: ['$totalHours', 1] },
+          attendanceRate: {
+            $concat: [
+              { $toString: { $round: [{ $multiply: [{ $divide: ['$present', daysInMonth] }, 100] }, 0] } },
+              '%'
+            ]
+          }
+        }
+      }
+    ]);
 
     res.json({
       month: `${month}/${year}`,
       daysInMonth,
-      stats: Object.values(stats)
+      stats
     });
   } catch (e) {
     console.error('Get attendance stats error:', e);
@@ -1461,19 +1502,47 @@ app.get('/api/revenue/total', async (req, res) => {
   }
 });
 
-// Configure Upload
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, 'uploads/')
-  },
-  filename: function (req, file, cb) {
-    cb(null, Date.now() + path.extname(file.originalname))
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// Helper function to delete image from Cloudinary
+const deleteImageFromCloudinary = async (imageUrl) => {
+  if (!imageUrl) return;
+  
+  try {
+    // Extract public ID from URL
+    // URL format: https://res.cloudinary.com/cloud_name/image/upload/v123/restaurant-pos/filename.jpg
+    const urlParts = imageUrl.split('/');
+    const filename = urlParts[urlParts.length - 1];
+    const publicId = `restaurant-pos/${filename.split('.')[0]}`;
+    
+    const result = await cloudinary.uploader.destroy(publicId);
+    if (result.result === 'ok') {
+      console.log(`✓ Deleted old image: ${publicId}`);
+    }
+  } catch (error) {
+    console.error('Error deleting image from Cloudinary:', error.message);
+    // Don't throw error - continue even if deletion fails
+  }
+};
+
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'restaurant-pos',
+    resource_type: 'auto',
+    format: async (req, file) => 'jpg',
+    public_id: (req, file) => `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
   }
 });
 
 const upload = multer({ 
   storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 5MB limit
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('image/')) {
       cb(null, true);
@@ -1485,21 +1554,26 @@ const upload = multer({
 
 // Upload endpoint
 app.post('/api/upload', (req, res, next) => {
-  // Set CORS headers trước upload
+  // Set CORS headers
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   res.header('Cross-Origin-Resource-Policy', 'cross-origin');
   next();
-}, upload.single('image'), (req, res) => {
+}, upload.single('image'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, error: 'Chưa chọn file ảnh' });
   }
   
   try {
-    const protocol = req.protocol;
-    const host = req.get('host');
-    const imageUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
+    const imageUrl = req.file.path;
+    const oldImageUrl = req.body.oldImageUrl; // Optional: URL of old image to delete
+    
+    // Delete old image if provided
+    if (oldImageUrl) {
+      await deleteImageFromCloudinary(oldImageUrl);
+    }
+    
     res.json({ success: true, url: imageUrl });
   } catch (e) {
     console.error('Upload error:', e);
@@ -1524,6 +1598,10 @@ app.post('/api/settings', async (req, res) => {
         runValidators: true 
       }
     );
+    
+    // ✓ TỐI ƯU: Xóa cache khi cập nhật settings
+    settingsCache = null;
+    settingsCacheTime = 0;
 
     io.emit('settings_updated', settings);
     res.json({ success: true, data: settings });
