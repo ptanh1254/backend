@@ -17,7 +17,24 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// ✓ TỐI ƯU: Thêm cache đơn giản cho settings
+// ✓ TỐI ƯU: Thêm cache system cho các queries thường xuyên
+const cacheStore = new Map();
+const setCacheWithTTL = (key, value, ttl = 5 * 60 * 1000) => {
+  cacheStore.set(key, { value, expiry: Date.now() + ttl });
+};
+const getCacheWithTTL = (key) => {
+  const cache = cacheStore.get(key);
+  if (cache && cache.expiry > Date.now()) return cache.value;
+  cacheStore.delete(key);
+  return null;
+};
+const clearCache = (pattern) => {
+  if (!pattern) return cacheStore.clear();
+  for (let [key] of cacheStore) {
+    if (key.includes(pattern)) cacheStore.delete(key);
+  }
+};
+
 let settingsCache = null;
 let settingsCacheTime = 0;
 const SETTINGS_CACHE_DURATION = 5 * 60 * 1000; // 5 phút
@@ -428,6 +445,11 @@ app.post('/api/login', handleLogin);
 
 app.get('/api/init', async (req, res) => {
   try {
+    // ✓ TỐI ƯU: Kiểm tra cache trước khi query
+    const cacheKey = 'init_data';
+    let cachedData = getCacheWithTTL(cacheKey);
+    if (cachedData) return res.json(cachedData);
+
     // ✓ TỐI ƯU: Dùng lean() và bỏ __v field, select fields cần thiết
     const [tables, menu, categories, activeOrders, settings] = await Promise.all([
       Table.find().sort({ name: 1 }).lean(),
@@ -437,7 +459,9 @@ app.get('/api/init', async (req, res) => {
       getCachedSettings() // ✓ TỐI ƯU: Dùng cache
     ]);
     
-    res.json({ tables, menu, categories, activeOrders, settings });
+    const initData = { tables, menu, categories, activeOrders, settings };
+    setCacheWithTTL(cacheKey, initData, 2 * 60 * 1000); // Cache 2 phút
+    res.json(initData);
   } catch (e) {
     console.error('Init error:', e);
     errorResponse(res, 500, 'Lỗi khi tải dữ liệu');
@@ -469,6 +493,8 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
         const n = new Model(req.body);
         await n.save();
         
+        // ✓ TỐI ƯU: Xóa cache khi dữ liệu thay đổi
+        clearCache('init_data');
         io.emit(`${routeName}_created`, n);
         res.status(201).json(n);
       } catch (e) {
@@ -506,6 +532,8 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
           return errorResponse(res, 404, 'Không tìm thấy dữ liệu');
         }
         
+        // ✓ TỐI ƯU: Xóa cache khi dữ liệu thay đổi
+        clearCache('init_data');
         io.emit(`${routeName}_updated`, updated);
         res.json({ success: true, data: updated });
       } catch (e) {
@@ -535,6 +563,8 @@ const createCrud = (Model, routeName, excludeRoutes = []) => {
           await deleteImageFromCloudinary(deleted.image);
         }
         
+        // ✓ TỐI ƯU: Xóa cache khi dữ liệu thay đổi
+        clearCache('init_data');
         io.emit(`${routeName}_deleted`, { _id: deleted._id });
         res.json({ success: true, message: 'Đã xóa thành công' });
       } catch (e) {
@@ -829,9 +859,13 @@ app.get('/api/attendance/today', async (req, res) => {
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
+    // ✓ TỐI ƯU: Dùng lean() để tăng tốc độ query
     const attendance = await Attendance.find({
       date: { $gte: today, $lt: tomorrow }
-    }).populate('staffId', 'name username role');
+    })
+      .populate('staffId', 'name username role')
+      .lean()
+      .select('-__v');
 
     res.json(attendance);
   } catch (e) {
@@ -852,9 +886,14 @@ app.get('/api/attendance/month', async (req, res) => {
     const startDate = new Date(parseInt(year), parseInt(month) - 1, 1);
     const endDate = new Date(parseInt(year), parseInt(month), 1);
 
+    // ✓ TỐI ƯU: Dùng lean() và select fields cần thiết
     const attendance = await Attendance.find({
       date: { $gte: startDate, $lt: endDate }
-    }).populate('staffId', 'name username role').sort({ date: -1, staffId: 1 });
+    })
+      .populate('staffId', 'name username role')
+      .sort({ date: -1, staffId: 1 })
+      .lean()
+      .select('-__v');
 
     res.json(attendance);
   } catch (e) {
@@ -1040,6 +1079,7 @@ app.post('/api/orders', async (req, res) => {
       }
       await existingOrder.save();
       
+      clearCache('init_data');
       await emitAllOrders();
       res.json(existingOrder);
     } else {
@@ -1051,6 +1091,7 @@ app.post('/api/orders', async (req, res) => {
       
       await newOrder.save();
       
+      clearCache('init_data');
       await emitAllOrders();
       res.status(201).json(newOrder);
     }
@@ -1077,6 +1118,7 @@ app.put('/api/orders/:orderId', async (req, res) => {
 
     if (Array.isArray(items) && items.length === 0) {
       const deletedOrder = await Order.findByIdAndDelete(orderId);
+      clearCache('init_data');
       await emitAllOrders();
       return res.json({ success: true, message: 'Đơn hàng đã được xóa' });
     }
@@ -1094,6 +1136,7 @@ app.put('/api/orders/:orderId', async (req, res) => {
 
     await order.save();
 
+    clearCache('init_data');
     await emitAllOrders();
 
     res.json({ success: true, data: order });
@@ -1157,6 +1200,7 @@ app.put('/api/orders/:orderId/items/:itemIdx', async (req, res) => {
     
     await order.save();
     
+    clearCache('init_data');
     await emitAllOrders();
     
     res.json({ success: true });
@@ -1208,6 +1252,7 @@ app.post('/api/pay', async (req, res) => {
       }
     }
 
+    clearCache('init_data');
     await emitAllOrders();
     
     res.json({ success: true, message: 'Thanh toán thành công' });
@@ -1221,9 +1266,10 @@ app.post('/api/pay', async (req, res) => {
 app.get('/api/cart/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
-    if (!sessionId) return res.status(400).json({ success: false, message: 'SessionId không hợp lệ' });
+    if (!sessionId || sessionId.length < 10) return res.status(400).json({ success: false, message: 'SessionId không hợp lệ' });
 
-    let cart = await Cart.findOne({ sessionId });
+    // ✓ TỐI ƯU: Dùng findOne với lean() 
+    let cart = await Cart.findOne({ sessionId }).lean();
     if (!cart) {
       cart = await Cart.create({ sessionId, items: [] });
     }
@@ -1239,7 +1285,7 @@ app.post('/api/cart/:sessionId/add', async (req, res) => {
     const { sessionId } = req.params;
     const { item } = req.body;
 
-    if (!sessionId || !item) return res.status(400).json({ success: false, message: 'Dữ liệu không hợp lệ' });
+    if (!sessionId || !item?._id) return res.status(400).json({ success: false, message: 'Dữ liệu không hợp lệ' });
 
     let cart = await Cart.findOne({ sessionId });
     if (!cart) {
@@ -1261,8 +1307,8 @@ app.post('/api/cart/:sessionId/add', async (req, res) => {
     cart.updatedAt = new Date();
     await cart.save();
     
-    // Emit cart update to all connected clients
-    io.emit('cart_updated', { sessionId, items: cart.items });
+    // ✓ TỐI ƯU: Dùng room-based broadcasting thay vì global emit
+    io.to(`cart:${sessionId}`).emit('cart_updated', { sessionId, items: cart.items });
     
     res.json({ success: true, data: cart });
   } catch (e) {
@@ -1276,7 +1322,9 @@ app.put('/api/cart/:sessionId/update/:itemId', async (req, res) => {
     const { sessionId, itemId } = req.params;
     const { quantity } = req.body;
 
-    if (!sessionId || !itemId || !quantity) return res.status(400).json({ success: false, message: 'Dữ liệu không hợp lệ' });
+    if (!sessionId || !itemId || quantity === undefined || quantity < 0) {
+      return res.status(400).json({ success: false, message: 'Dữ liệu không hợp lệ' });
+    }
 
     const cart = await Cart.findOne({ sessionId });
     if (!cart) return res.status(404).json({ success: false, message: 'Giỏ hàng không tồn tại' });
@@ -1284,14 +1332,15 @@ app.put('/api/cart/:sessionId/update/:itemId', async (req, res) => {
     const item = cart.items.find(i => i._id?.toString() === itemId);
     if (!item) return res.status(404).json({ success: false, message: 'Mục không tồn tại' });
 
-    item.quantity = quantity;
-    if (item.quantity <= 0) {
+    if (quantity === 0) {
       cart.items = cart.items.filter(i => i._id?.toString() !== itemId);
+    } else {
+      item.quantity = quantity;
     }
 
     cart.updatedAt = new Date();
     await cart.save();
-    io.emit('cart_updated', { sessionId, items: cart.items });
+    io.to(`cart:${sessionId}`).emit('cart_updated', { sessionId, items: cart.items });
     res.json({ success: true, data: cart });
   } catch (e) {
     console.error('Update cart error:', e);
@@ -1308,10 +1357,15 @@ app.delete('/api/cart/:sessionId/remove/:itemId', async (req, res) => {
     const cart = await Cart.findOne({ sessionId });
     if (!cart) return res.status(404).json({ success: false, message: 'Giỏ hàng không tồn tại' });
 
+    const initialLength = cart.items.length;
     cart.items = cart.items.filter(i => i._id?.toString() !== itemId);
-    cart.updatedAt = new Date();
-    await cart.save();
-    io.emit('cart_updated', { sessionId, items: cart.items });
+    
+    // ✓ TỐI ƯU: Chỉ save nếu có thay đổi
+    if (initialLength !== cart.items.length) {
+      cart.updatedAt = new Date();
+      await cart.save();
+      io.to(`cart:${sessionId}`).emit('cart_updated', { sessionId, items: cart.items });
+    }
     res.json({ success: true, data: cart });
   } catch (e) {
     console.error('Remove from cart error:', e);
@@ -1326,7 +1380,7 @@ app.delete('/api/cart/:sessionId/clear', async (req, res) => {
     if (!sessionId) return res.status(400).json({ success: false, message: 'SessionId không hợp lệ' });
 
     await Cart.deleteOne({ sessionId });
-    io.emit('cart_updated', { sessionId, items: [] });
+    io.to(`cart:${sessionId}`).emit('cart_updated', { sessionId, items: [] });
     res.json({ success: true, message: 'Giỏ hàng đã được xóa' });
   } catch (e) {
     console.error('Clear cart error:', e);
@@ -1352,9 +1406,12 @@ app.get('/api/reports', async (req, res) => {
       query.paidAt = { $gte: fromDate, $lte: toDate };
     }
 
+    // ✓ TỐI ƯU: Dùng lean() và select fields cần thiết
     const reports = await Order.find(query)
       .sort({ paidAt: -1 })
-      .limit(100);
+      .limit(100)
+      .lean()
+      .select('-__v');
 
     res.json(reports);
   } catch (e) {
